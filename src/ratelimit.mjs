@@ -10,6 +10,27 @@ export const DAILY_LIMIT = 30;
 export const BURST_LIMIT = 3;
 export const BURST_WINDOW_MS = 10 * 60 * 1000;
 export const TEXT_LIMIT = 1000;
+/**
+ * 请求体字节上限。正常反馈 1000 字中文约 3KB，加上 JSON 开销远远不到这里。
+ * 超过就别 parse 了：`normaliseClientText` 会对整个字符串跑正则，
+ * 几十 MB 的 body 会直接把 Workers 的 10ms CPU 打爆，返回 HTML 1102 页。
+ */
+export const MAX_BODY_BYTES = 16 * 1024;
+
+const encoder = new TextEncoder();
+
+/** 字符串的 UTF-8 字节数。Workers 没有 Buffer，统一用 TextEncoder。 */
+function byteLength(s) {
+  return encoder.encode(s).length;
+}
+
+/**
+ * 这段文本是否超过请求体上限。
+ * 按**字节**判断而不是字符：1000 个中文是 3000 字节，1000 个 emoji 更多。
+ */
+export function textTooLong(text) {
+  return byteLength(String(text === undefined || text === null ? "" : text)) > MAX_BODY_BYTES;
+}
 
 /** UTC 日期串，作为日额度键的一部分。按 UTC 切日，避免时区边界摇摆。 */
 export function utcDay(date) {
@@ -24,13 +45,17 @@ export function nextResetAt(now) {
 }
 
 /**
- * 每 IP 的额度键。取 SHA-256 前 16 位十六进制：
- * KV 键不进日志、也不该留明文 IP，16 位足够避免碰撞。
+ * 每 IP 的额度键：加盐 FNV-1a 变体的前 16 位十六进制。
+ *
+ * 注意措辞：这是**加盐假名化**，不是「不可逆哈希」。IPv4 只有 2^32 个地址，
+ * 拿一张「哈希→IP」对照表就能全量反查；加盐只是让这张表不能预先算好、
+ * 换部署就不通用。真正的隐私保证来自「不落明文、不进日志」。
+ *
+ * @param {unknown} ip
+ * @param {string} salt 部署级密钥（`wrangler secret put IP_SALT`）
  */
-export function clientKey(ip) {
-  const raw = String(ip === undefined || ip === null ? "" : ip);
-  // 纯 JS 的 SHA-256 太长，这里用同步的 FNV-1a 变体即可满足「不可逆、不碰撞到
-  // 肉眼可见」的要求；真正敏感的是邮箱凭据，不是 IP 的反向难度。
+export function clientKey(ip, salt) {
+  const raw = String(salt === undefined || salt === null ? "" : salt) + "|" + String(ip === undefined || ip === null ? "" : ip);
   let h1 = 0x811c9dc5;
   let h2 = 0x01000193;
   for (let i = 0; i < raw.length; i++) {
@@ -82,6 +107,22 @@ export function buildMailSubject(o) {
   return ("[CC GUI 反馈] " + plugin + " · " + normaliseClientText(o && o.text).slice(0, 40)).slice(0, 120);
 }
 
+/**
+ * 把客户端给的时间戳转成 ISO 字符串，越界时回落到服务端时间。
+ *
+ * `ts` 完全由客户端控制。`|ts| > 8.64e15`（或 Infinity/NaN）会让
+ * `new Date(ts).toISOString()` 抛 RangeError，被上层当成发信失败，
+ * 用户于是「重试必然失败」却以为是网络问题。
+ */
+export function safeIsoTime(ts, fallback) {
+  // null/undefined/空串 = 「没给」，用服务端时间。不能靠 Number() 转：
+  // Number(null) === 0、Number("") === 0，都会变成 1970。
+  const missing = ts === undefined || ts === null || ts === "";
+  const n = Number(ts);
+  const valid = !missing && Number.isFinite(n) && Math.abs(n) <= 8640000000000000;
+  return new Date(valid ? n : fallback).toISOString();
+}
+
 /** 邮件正文：原文 + 一段版本信息，便于复现。 */
 export function buildMailBody(o) {
   const text = normaliseClientText(o && o.text);
@@ -93,6 +134,6 @@ export function buildMailBody(o) {
     "插件：" + String((o && o.pluginId) || ""),
     "插件版本：" + String((o && o.pluginVersion) || ""),
     "CC GUI：" + String((o && o.hostVersion) || ""),
-    "时间：" + new Date(ts).toISOString(),
+    "时间：" + safeIsoTime(ts, Date.now()),
   ].join("\n");
 }

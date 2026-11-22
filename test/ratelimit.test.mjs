@@ -11,6 +11,9 @@ import {
   normaliseClientText,
   buildMailSubject,
   buildMailBody,
+  safeIsoTime,
+  textTooLong,
+  MAX_BODY_BYTES,
 } from "../src/ratelimit.mjs";
 
 test("utcDay 按 UTC 切日，跨时区不漂移", () => {
@@ -120,4 +123,43 @@ test("buildMailBody 保留正文并附上版本信息", () => {
 
 test("BURST_LIMIT 小于 DAILY_LIMIT——否则突发限制永远先不触发", () => {
   assert.ok(BURST_LIMIT < DAILY_LIMIT);
+});
+
+test("safeIsoTime 挡住越界时间戳，不让 toISOString 抛错", () => {
+  const now = 1795000000000;
+  // 客户端可控。越界会让 new Date(ts).toISOString() 抛 RangeError，
+  // 被当成 smtp_failed，用户永远重试不成功。
+  assert.equal(safeIsoTime(1e16, now), new Date(now).toISOString());
+  assert.equal(safeIsoTime(-1e16, now), new Date(now).toISOString());
+  // 注意不能用 8.64e15 + 1：双精度下它等于 8.64e15，仍是合法值。
+  assert.equal(safeIsoTime(8.64e15 * 2, now), new Date(now).toISOString());
+  assert.equal(safeIsoTime(Infinity, now), new Date(now).toISOString());
+  assert.equal(safeIsoTime(NaN, now), new Date(now).toISOString());
+  assert.equal(safeIsoTime("abc", now), new Date(now).toISOString());
+  assert.equal(safeIsoTime(null, now), new Date(now).toISOString());
+  // 合法值原样用。
+  assert.equal(safeIsoTime(1795000000000, now), new Date(1795000000000).toISOString());
+});
+
+test("buildMailBody 遇到越界 ts 不抛错", () => {
+  assert.doesNotThrow(() => buildMailBody({ text: "hi", ts: 1e16 }));
+  assert.match(buildMailBody({ text: "hi", ts: 1e16 }), /时间：/);
+});
+
+test("textTooLong 用字节数而不是字符数判断——中文一个字符 3 字节", () => {
+  // 1000 个中文 = 3000 字节，仍在 MAX_BODY_BYTES 之内。
+  assert.equal(textTooLong("中".repeat(1000)), false);
+  // 超大的 body 必须在 JSON.parse 之前就被挡住，否则正则全量遍历会烧 CPU。
+  // 边界是「超过」，正好等于上限不算超。
+  assert.equal(textTooLong("a".repeat(MAX_BODY_BYTES)), false);
+  assert.equal(textTooLong("a".repeat(MAX_BODY_BYTES + 1)), true);
+});
+
+test("clientKey 是加盐假名化，注释不能谎称不可逆", () => {
+  // 不同盐必须给出不同键：否则拿 IP 全量枚举就能反查。
+  const a = clientKey("1.2.3.4", "salt-one");
+  const b = clientKey("1.2.3.4", "salt-two");
+  assert.notEqual(a, b, "换盐必须改变键");
+  // 同一盐同输入稳定。
+  assert.equal(clientKey("1.2.3.4", "s"), clientKey("1.2.3.4", "s"));
 });

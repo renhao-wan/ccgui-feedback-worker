@@ -62,6 +62,16 @@ test("decideLimit 第三条之后触发突发保护", () => {
   assert.equal(r.kind, "burst");
 });
 
+test("突发被拒时剩余额度仍然反映今天的真实余量", () => {
+  // 用户 5 秒内点了四下，日额度还剩 27 条。此时若把 remaining 写成 0，
+  // 界面会说「今天用完了」——用户会等到明天，明明十分钟后就好。
+  const now = 100_000;
+  const burst = [now - 1000, now - 800, now - 600];
+  const r = decideLimit({ used: BURST_LIMIT, burst }, now);
+  assert.equal(r.kind, "burst");
+  assert.equal(r.remaining, DAILY_LIMIT - BURST_LIMIT, "突发拒绝不该把日额度说成 0");
+});
+
 test("decideLimit 窗口外的旧记录不算数", () => {
   const now = 1_000_000;
   const burst = [now - BURST_WINDOW_MS - 1, now - BURST_WINDOW_MS - 2];

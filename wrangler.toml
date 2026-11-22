@@ -6,7 +6,7 @@ compatibility_date = "2026-11-01"
 # 先 `wrangler kv namespace create FEEDBACK_KV`，把返回的 id 填到下面。
 [[kv_namespaces]]
 binding = "FEEDBACK_KV"
-id = "REPLACE_WITH_NAMESPACE_ID"
+id = "669abad230cc43209485c8fdf59c2a29"
 
 # 敏感项不要写在这里（这个文件会进 git）。用 `wrangler secret put` 设置：
 #   SMTP_USER  QQ 邮箱地址

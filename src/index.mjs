@@ -118,7 +118,8 @@ async function handleFeedback(env, request) {
       ok: false,
       error: "rate_limited",
       kind: verdict.kind,
-      remaining: 0,
+      // 突发限流时今天还剩额度，写 0 会让界面说「今天用完了」——那是假话。
+      remaining: verdict.kind === "daily" ? 0 : Math.max(0, DAILY_LIMIT - state.used),
       resetAt: nextResetAt(now),
     });
   }

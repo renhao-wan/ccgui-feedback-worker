@@ -1,0 +1,19 @@
+{
+  "name": "ccgui-feedback-worker",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "CC GUI 插件反馈中转：把插件里填的文字转发到邮箱",
+  "scripts": {
+    "test": "node --test test/",
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "secret": "wrangler secret put"
+  },
+  "devDependencies": {
+    "wrangler": "^4.0.0"
+  },
+  "dependencies": {
+    "worker-mailer": "^1.0.0"
+  }
+}

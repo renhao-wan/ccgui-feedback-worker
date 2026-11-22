@@ -1,0 +1,20 @@
+name = "ccgui-feedback"
+main = "src/index.mjs"
+compatibility_date = "2026-11-01"
+
+# 额度计数。免费额度 10 万读/天、1000 写/天——按反馈量级远远够用。
+# 先 `wrangler kv namespace create FEEDBACK_KV`，把返回的 id 填到下面。
+[[kv_namespaces]]
+binding = "FEEDBACK_KV"
+id = "REPLACE_WITH_NAMESPACE_ID"
+
+# 敏感项不要写在这里（这个文件会进 git）。用 `wrangler secret put` 设置：
+#   SMTP_USER  QQ 邮箱地址
+#   SMTP_PASS  QQ 邮箱 SMTP 授权码（不是登录密码）
+#   MAIL_TO    收件邮箱
+# 可选：
+#   SMTP_HOST  默认 smtp.qq.com
+#   SMTP_PORT  默认 465（隐式 TLS）
+
+[observability]
+enabled = true

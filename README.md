@@ -12,10 +12,11 @@ CC GUI 插件的反馈中转。插件设置页里填的文字经这里转发到�
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
-| `GET` | `/quota` | 返回 `{ remaining, dailyLimit, resetAt }`，设置页打开时查一次 |
-| `POST` | `/feedback` | `{ text, pluginId, pluginVersion, hostVersion, ts }` → `{ ok, remaining }` |
+| `GET` | `/quota?pluginId=<id>` | 返回 `{ remaining, dailyLimit, resetAt, fallbackRemaining }`，设置页打开时查一次 |
+| `POST` | `/feedback` | `{ text, pluginId, pluginVersion, hostVersion, ts }` → `{ ok, remaining, fallbackRemaining }` |
 
-失败时：`429 { error: "rate_limited", kind, resetAt }`（额度用完）、
+失败时：`429 { error: "rate_limited", kind, resetAt }`（`kind: "cooldown"` 本插件 48h 冷却 + 兜底也用完；
+`kind: "burst"` 兜底池突发窗口撞了、本插件仍在冷却）、
 `400`（正文为空 / 插件不在白名单）、`413 { error: "too_large" }`（请求体超 16KB）、
 `502 { error: "smtp_failed" }`（发信失败，额度已退回）、
 `503 { error: "storage_unavailable" }`（KV 不可用）。
@@ -26,11 +27,19 @@ CC GUI 插件的反馈中转。插件设置页里填的文字经这里转发到�
 
 ## 额度
 
-**每 IP 每天 30 条，四个插件共享同一个池**——限流键是 `IP 哈希 + UTC 日期`，
-刻意不含插件名，否则换个插件就能再拿一份额度。
+**每 IP × 每插件，滚动 48 小时 1 条**。冷却键是 `IP 哈希 + 插件 id`，**含插件名**：
+四个插件各自独立计时，一个插件发过不影响另一个。
 
-另加 **10 分钟 3 条** 的突发保护，防止脚本刷屏。两个计数存在同一个 KV 值里，
-值带 2 天 TTL——额度按 UTC 日切分，跨日之后旧键就永远读不到了。
+另有一个**每 IP 每天 3 条的共享兜底池**，键是 `IP 哈希 + UTC 日期`，**不含插件名**——
+跨插件共用，只在本插件冷却命中时才动用。它存在的理由：插件零凭据、不收集设备指纹，
+Worker 唯一可信身份是 IP，「每用户」只能退化成「每 IP」。公司 / 校园 / CGNAT 这类
+共享出口里，一个人发过会把整栋楼卡在 48 小时冷却里，兜底池就是放过这些正常用户的口子。
+因为它是全 IP 共享的，「换个插件接着刷」也吃同一份，防跨插件刷的职责从「共享大池」挪到了这里。
+
+兜底路径另有 **10 分钟 2 条** 的突发保护（必须严格小于每天 3 条，否则第三条永远先撞日额度，
+突发保护形同虚设）。冷却键 TTL 3 天，兜底键 TTL 2 天。
+
+> 已知后果：单人 48 小时内最多 4 条（常规 1 + 兜底 3）。这是兜底池的刻意代价。
 
 > 额度是自设的，不是 Cloudflare 的配额。Workers 免费额度是 10 万请求/天，
 > 对反馈量来说等于无限——拿它当卖点对用户没有意义。真正会先撞的有两处：
@@ -41,8 +50,8 @@ CC GUI 插件的反馈中转。插件设置页里填的文字经这里转发到�
 >   再写一次退款）。也就是说极端情况下全站每天最多约 1000 条反馈。这是
 >   兜底上限，不是设计目标；真要放开得换 Durable Object。
 
-**并发不是严格的**：KV 没有 compare-and-swap，两个请求同时读到 `used=0`
-会各记一条。这里的计数是「降低重放」，不是「消除」。要严格得换 Durable Object。
+**并发不是严格的**：KV 没有 compare-and-swap，两个请求同时读到旧值会各记一条。
+这里的计数是「降低重放」，不是「消除」。要严格得换 Durable Object。
 
 ## 部署
 
@@ -70,15 +79,15 @@ npx wrangler deploy
 
 注意只影响 IPv4 用户：IPv6 的空间是 2¹²⁸，枚举不成立。
 
-换盐的副作用：额度键变了，**当天所有人的额度重置一次**。一次性，第二天自然恢复。
+换盐的副作用：额度键与冷却键都变了，**当天所有人的额度重置一次**。一次性，第二天自然恢复。
 
 部署完会得到一个 `https://ccgui-feedback.<你的账号>.workers.dev`。
 
 部署后可以自测：
 
 ```bash
-curl "https://ccgui-feedback.<你的账号>.workers.dev/quota"
-# {"remaining":30,"dailyLimit":30,"resetAt":...}
+curl "https://ccgui-feedback.<你的账号>.workers.dev/quota?pluginId=github-trending"
+# {"remaining":1,"dailyLimit":1,"resetAt":...,"fallbackRemaining":3}
 ```
 
 ### 端点变了要同步改两处
@@ -138,9 +147,9 @@ Worker 只接收、只转发五个字段：正文、插件 id、插件版本、C
 npm test
 ```
 
-覆盖：UTC 切日、额度键不含插件名、日额度 / 突发两条拒绝路径、窗口过期、
-正文收敛与限长、请求体字节上限、邮件主题防头注入、越界时间戳降级、
+覆盖：UTC 切日、冷却键含插件名 / 兜底键不含插件名、48 小时边界、兜底池日额度与突发两条拒绝路径、
+窗口过期、正文收敛与限长、请求体字节上限、邮件主题防头注入、越界时间戳降级、
 加盐假名化（换盐必须换键）。
 
-Worker 的路由与 KV 读写由集成测试之外的手工冒烟覆盖（`curl /quota`、
-连发 4 条看 429 的 `kind: "burst"`）。
+Worker 的路由与 KV 读写由集成测试之外的手工冒烟覆盖（`curl /quota?pluginId=...`、
+同一插件连发两条看 429 的 `kind: "cooldown"`、冷却中换插件看兜底池放行）。

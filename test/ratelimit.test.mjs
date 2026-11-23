@@ -1,12 +1,17 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
-  DAILY_LIMIT,
+  COOLDOWN_MS,
+  FALLBACK_DAILY_LIMIT,
   BURST_LIMIT,
   BURST_WINDOW_MS,
   utcDay,
   clientKey,
-  decideLimit,
+  cooldownKey,
+  fallbackKey,
+  decideCooldown,
+  decideFallback,
+  quotaView,
   nextResetAt,
   normaliseClientText,
   buildMailSubject,
@@ -27,13 +32,8 @@ test("nextResetAt 指向次日 UTC 零点", () => {
   assert.equal(nextResetAt(now), Date.parse("2026-11-23T00:00:00Z"));
 });
 
-test("clientKey 不含插件名——额度是所有插件共享的一个池", () => {
-  const a = clientKey("1.2.3.4");
-  const b = clientKey("1.2.3.4");
-  assert.equal(a, b, "同一 IP 必须得到同一个键");
-  assert.notEqual(a, clientKey("1.2.3.5"));
-  // 键里不能出现插件标识，否则每个插件会各有一份额度。
-  assert.doesNotMatch(a, /github-trending|worklog/);
+test("冷却窗口正好是 48 小时", () => {
+  assert.equal(COOLDOWN_MS, 48 * 60 * 60 * 1000);
 });
 
 test("clientKey 对 IP 做哈希，不落明文", () => {
@@ -42,56 +42,114 @@ test("clientKey 对 IP 做哈希，不落明文", () => {
   assert.match(key, /^[0-9a-f]{16}$/);
 });
 
-test("decideLimit 首次发送放行并返回剩余", () => {
-  const r = decideLimit({ used: 0, burst: [] }, 1000);
-  assert.equal(r.allowed, true);
-  assert.equal(r.remaining, DAILY_LIMIT - 1);
+test("clientKey 是加盐假名化，注释不能谎称不可逆", () => {
+  // 不同盐必须给出不同键：否则拿 IP 全量枚举就能反查。
+  const a = clientKey("1.2.3.4", "salt-one");
+  const b = clientKey("1.2.3.4", "salt-two");
+  assert.notEqual(a, b, "换盐必须改变键");
+  assert.equal(clientKey("1.2.3.4", "s"), clientKey("1.2.3.4", "s"));
 });
 
-test("decideLimit 用完日额度后拒绝", () => {
-  const r = decideLimit({ used: DAILY_LIMIT, burst: [] }, 1000);
+test("冷却键按插件隔离，且不含明文 IP", () => {
+  const ipKey = clientKey("203.0.113.9");
+  const a = cooldownKey(ipKey, "github-trending");
+  const b = cooldownKey(ipKey, "worklog");
+  assert.notEqual(a, b, "不同插件必须是不同的冷却键");
+  assert.match(a, /github-trending/, "冷却键带插件名，便于排查");
+  assert.doesNotMatch(a, /203\.0\.113\.9/, "冷却键里不能出现明文 IP");
+  // 同 IP 同插件稳定。
+  assert.equal(a, cooldownKey(ipKey, "github-trending"));
+});
+
+test("兜底池键跨插件共享——换插件刷同一份池", () => {
+  const ipKey = clientKey("203.0.113.9");
+  const day = "2026-11-23";
+  // 键里刻意不带插件名：换了插件也吃同一份额度。
+  assert.doesNotMatch(fallbackKey(ipKey, day), /github-trending|worklog/);
+  assert.equal(fallbackKey(ipKey, day), fallbackKey(ipKey, day));
+  assert.notEqual(fallbackKey(ipKey, day), fallbackKey(ipKey, "2026-11-24"));
+});
+
+test("decideCooldown 无记录时放行", () => {
+  const r = decideCooldown(0, 1000);
+  assert.equal(r.available, true);
+  assert.equal(r.retryAt, 0);
+});
+
+test("decideCooldown 脏数据当作无记录，不误拦", () => {
+  for (const bad of [undefined, null, NaN, -1, "abc", Infinity]) {
+    assert.equal(decideCooldown(bad, 1000).available, true, String(bad));
+  }
+});
+
+test("decideCooldown 满 48 小时前拒绝、到点放行", () => {
+  const last = 1_000_000;
+  // 差 1 毫秒满 48 小时：仍冷却中。
+  const justBefore = decideCooldown(last, last + COOLDOWN_MS - 1);
+  assert.equal(justBefore.available, false);
+  assert.equal(justBefore.retryAt, last + COOLDOWN_MS);
+  // 正好 48 小时：放行。
+  assert.equal(decideCooldown(last, last + COOLDOWN_MS).available, true);
+  assert.equal(decideCooldown(last, last + COOLDOWN_MS + 1).available, true);
+});
+
+test("decideFallback 首次动用兜底放行", () => {
+  const r = decideFallback({ used: 0, burst: [] }, 1000);
+  assert.equal(r.allowed, true);
+  assert.equal(r.kind, "ok");
+  assert.equal(r.remaining, FALLBACK_DAILY_LIMIT - 1);
+});
+
+test("decideFallback 兜底池用完就拒", () => {
+  const r = decideFallback({ used: FALLBACK_DAILY_LIMIT, burst: [] }, 1000);
   assert.equal(r.allowed, false);
-  assert.equal(r.kind, "daily");
+  assert.equal(r.kind, "fallback");
   assert.equal(r.remaining, 0);
 });
 
-test("decideLimit 第三条之后触发突发保护", () => {
+test("decideFallback 边界：还剩一条时能发", () => {
+  const r = decideFallback({ used: FALLBACK_DAILY_LIMIT - 1, burst: [] }, 1000);
+  assert.equal(r.allowed, true);
+  assert.equal(r.remaining, 0);
+});
+
+test("decideFallback 第三条之后触发突发保护", () => {
   const now = 100_000;
-  // 窗口内已有 BURST_LIMIT 条，这条就该被拒。留 1 条日额度，确保拒的原因
-  // 是突发而不是日额度——两种 kind 的文案不同。
   const burst = [now - 1000, now - 800, now - 600];
-  const r = decideLimit({ used: BURST_LIMIT, burst }, now);
+  const r = decideFallback({ used: BURST_LIMIT, burst }, now);
   assert.equal(r.allowed, false);
   assert.equal(r.kind, "burst");
+  // 突发被拒时兜底池其实还有剩，不能谎报 0。
+  assert.equal(r.remaining, FALLBACK_DAILY_LIMIT - BURST_LIMIT);
 });
 
-test("突发被拒时剩余额度仍然反映今天的真实余量", () => {
-  // 用户 5 秒内点了四下，日额度还剩 27 条。此时若把 remaining 写成 0，
-  // 界面会说「今天用完了」——用户会等到明天，明明十分钟后就好。
-  const now = 100_000;
-  const burst = [now - 1000, now - 800, now - 600];
-  const r = decideLimit({ used: BURST_LIMIT, burst }, now);
-  assert.equal(r.kind, "burst");
-  assert.equal(r.remaining, DAILY_LIMIT - BURST_LIMIT, "突发拒绝不该把日额度说成 0");
-});
-
-test("decideLimit 窗口外的旧记录不算数", () => {
+test("decideFallback 窗口外的旧记录不算数", () => {
   const now = 1_000_000;
   const burst = [now - BURST_WINDOW_MS - 1, now - BURST_WINDOW_MS - 2];
-  const r = decideLimit({ used: 2, burst }, now);
+  const r = decideFallback({ used: 2, burst }, now);
   assert.equal(r.allowed, true);
 });
 
-test("decideLimit 额度边界：剩一条时还能发", () => {
-  const r = decideLimit({ used: DAILY_LIMIT - 1, burst: [] }, 1000);
-  assert.equal(r.allowed, true);
-  assert.equal(r.remaining, 0);
+test("quotaView 冷却中 remaining=0，并给出重试时刻", () => {
+  const last = 1_000_000;
+  const now = last + 1000;
+  const v = quotaView({ cooldownLast: last, fallback: { used: 0 }, now });
+  assert.equal(v.remaining, 0);
+  assert.equal(v.dailyLimit, 1);
+  assert.equal(v.resetAt, last + COOLDOWN_MS);
+  assert.equal(v.fallbackRemaining, FALLBACK_DAILY_LIMIT);
 });
 
-test("decideLimit 突发保护不会超过日额度判断", () => {
-  // 日额度已用完时，就算窗口里没记录也必须拒绝。
-  const r = decideLimit({ used: DAILY_LIMIT, burst: [] }, 1000);
-  assert.equal(r.kind, "daily");
+test("quotaView 未冷却 remaining=1", () => {
+  const now = 1_000_000;
+  const v = quotaView({ cooldownLast: 0, fallback: { used: 1 }, now });
+  assert.equal(v.remaining, 1);
+  assert.equal(v.fallbackRemaining, FALLBACK_DAILY_LIMIT - 1);
+});
+
+test("quotaView 兜底池用尽时 fallbackRemaining=0，不出现负数", () => {
+  const v = quotaView({ cooldownLast: 0, fallback: { used: 99 }, now: 1000 });
+  assert.equal(v.fallbackRemaining, 0);
 });
 
 test("normaliseClientText 收敛并限长", () => {
@@ -121,23 +179,19 @@ test("buildMailBody 保留正文并附上版本信息", () => {
   assert.match(body, /2026-11-18/);
 });
 
-test("BURST_LIMIT 小于 DAILY_LIMIT——否则突发限制永远先不触发", () => {
-  assert.ok(BURST_LIMIT < DAILY_LIMIT);
+test("BURST_LIMIT 小于 FALLBACK_DAILY_LIMIT——否则突发限制永远先不触发", () => {
+  assert.ok(BURST_LIMIT < FALLBACK_DAILY_LIMIT);
 });
 
 test("safeIsoTime 挡住越界时间戳，不让 toISOString 抛错", () => {
   const now = 1795000000000;
-  // 客户端可控。越界会让 new Date(ts).toISOString() 抛 RangeError，
-  // 被当成 smtp_failed，用户永远重试不成功。
   assert.equal(safeIsoTime(1e16, now), new Date(now).toISOString());
   assert.equal(safeIsoTime(-1e16, now), new Date(now).toISOString());
-  // 注意不能用 8.64e15 + 1：双精度下它等于 8.64e15，仍是合法值。
   assert.equal(safeIsoTime(8.64e15 * 2, now), new Date(now).toISOString());
   assert.equal(safeIsoTime(Infinity, now), new Date(now).toISOString());
   assert.equal(safeIsoTime(NaN, now), new Date(now).toISOString());
   assert.equal(safeIsoTime("abc", now), new Date(now).toISOString());
   assert.equal(safeIsoTime(null, now), new Date(now).toISOString());
-  // 合法值原样用。
   assert.equal(safeIsoTime(1795000000000, now), new Date(1795000000000).toISOString());
 });
 
@@ -147,19 +201,7 @@ test("buildMailBody 遇到越界 ts 不抛错", () => {
 });
 
 test("textTooLong 用字节数而不是字符数判断——中文一个字符 3 字节", () => {
-  // 1000 个中文 = 3000 字节，仍在 MAX_BODY_BYTES 之内。
   assert.equal(textTooLong("中".repeat(1000)), false);
-  // 超大的 body 必须在 JSON.parse 之前就被挡住，否则正则全量遍历会烧 CPU。
-  // 边界是「超过」，正好等于上限不算超。
   assert.equal(textTooLong("a".repeat(MAX_BODY_BYTES)), false);
   assert.equal(textTooLong("a".repeat(MAX_BODY_BYTES + 1)), true);
-});
-
-test("clientKey 是加盐假名化，注释不能谎称不可逆", () => {
-  // 不同盐必须给出不同键：否则拿 IP 全量枚举就能反查。
-  const a = clientKey("1.2.3.4", "salt-one");
-  const b = clientKey("1.2.3.4", "salt-two");
-  assert.notEqual(a, b, "换盐必须改变键");
-  // 同一盐同输入稳定。
-  assert.equal(clientKey("1.2.3.4", "s"), clientKey("1.2.3.4", "s"));
 });

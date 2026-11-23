@@ -3,22 +3,27 @@
  *
  * 路由：
  *   POST /feedback  { text, pluginId, pluginVersion, hostVersion, ts }
- *   GET  /quota     → { remaining, dailyLimit, resetAt }
+ *   GET  /quota?pluginId=<id>  → { remaining, dailyLimit, resetAt, fallbackRemaining }
  *
  * 为什么需要这一层：插件源码完全公开，任何邮件凭据写进去都等于公开。
  * 凭据只存在 Worker 的 secret 里，插件只知道这个公开端点。
  *
- * 额度：每 IP 每天 30 条，**四个插件共享同一个池**（键不含插件名）。
- * 另加 10 分钟 3 条的突发保护。捆在同一份 KV 值里，一次读写搞定。
+ * 额度（2026-11-23 改版）：**每 IP × 每插件，滚动 48 小时 1 条**；另加
+ * 一个**每 IP 每天 3 条的兜底池**，跨插件共享，只在该插件冷却命中时才动用。
+ * 详见 ratelimit.mjs 的头注释。
  */
 
 import { WorkerMailer } from "worker-mailer";
 import {
-  DAILY_LIMIT,
+  FALLBACK_DAILY_LIMIT,
   MAX_BODY_BYTES,
   utcDay,
   clientKey,
-  decideLimit,
+  cooldownKey,
+  fallbackKey,
+  decideCooldown,
+  decideFallback,
+  quotaView,
   nextResetAt,
   normaliseClientText,
   textTooLong,
@@ -54,19 +59,20 @@ function clientIp(request) {
 }
 
 /**
- * KV 键的存活时间。额度按 UTC 日切分，跨日之后旧键就永远读不到了，
- * 留着只是占存储。给两天余量，跨日边界上不误删正在用的键。
+ * KV 键的存活时间。冷却键要活过 48 小时窗口（给一天余量）；兜底池键按
+ * UTC 日切分，两天余量即可。
  */
-const STATE_TTL_SECONDS = 2 * 24 * 60 * 60;
+const COOLDOWN_TTL_SECONDS = 3 * 24 * 60 * 60;
+const FALLBACK_TTL_SECONDS = 2 * 24 * 60 * 60;
 
-/** 同一个 KV 键同时存日计数与突发窗口，一次 get / 一次 put。 */
-async function readState(kv, key) {
+/** 兜底池状态：日计数 + 突发窗口，一次 get / 一次 put。 */
+async function readFallback(kv, key) {
   const raw = await kv.get(key);
   if (!raw) return { used: 0, burst: [] };
   try {
     const v = JSON.parse(raw);
     // used 必须收敛到非负整数：脏数据会直接进 remaining 的计算，
-    // 出现「-5」「35」这种越界结果，比直接当 0 更糟。
+    // 出现「-5」「9」这种越界结果，比直接当 0 更糟。
     const used = Math.max(0, Math.floor(Number(v.used) || 0));
     return { used, burst: Array.isArray(v.burst) ? v.burst : [] };
   } catch {
@@ -74,10 +80,27 @@ async function readState(kv, key) {
   }
 }
 
-async function writeState(kv, key, state) {
+async function writeFallback(kv, key, state) {
   await kv.put(key, JSON.stringify({ used: state.used, burst: state.burst.slice(-20) }), {
-    expirationTtl: STATE_TTL_SECONDS,
+    expirationTtl: FALLBACK_TTL_SECONDS,
   });
+}
+
+/** 冷却状态只存一个上次发送时刻，读不到/脏数据都当作「从未发过」。 */
+async function readCooldown(kv, key) {
+  try {
+    const raw = await kv.get(key);
+    if (!raw) return 0;
+    const v = JSON.parse(raw);
+    const t = Number(v && v.last);
+    return Number.isFinite(t) && t > 0 ? t : 0;
+  } catch {
+    return 0;
+  }
+}
+
+async function writeCooldown(kv, key, last) {
+  await kv.put(key, JSON.stringify({ last }), { expirationTtl: COOLDOWN_TTL_SECONDS });
 }
 
 /** 按端口决定 TLS 形态：465 是隐式 TLS，587 必须走 STARTTLS（secure:false）。 */
@@ -113,21 +136,30 @@ function storageFailure() {
 }
 
 async function handleQuota(env, request) {
-  let state;
+  const url = new URL(request.url);
+  const pluginId = String(url.searchParams.get("pluginId") || "");
+  // 老版本插件不带 pluginId。回一个乐观值（本插件「现在能发」），不阻断它们。
+  if (!ALLOWED_PLUGINS.has(pluginId)) {
+    return json(
+      200,
+      { remaining: 1, dailyLimit: 1, resetAt: nextResetAt(Date.now()), fallbackRemaining: FALLBACK_DAILY_LIMIT },
+      { "cache-control": "public, max-age=10" },
+    );
+  }
+  const now = Date.now();
+  let cooldownLast;
+  let fallback;
   try {
-    const key = clientKey(clientIp(request), env.IP_SALT);
-    const day = utcDay(Date.now());
-    state = await readState(env.FEEDBACK_KV, "rl:" + key + ":" + day);
+    const ipKey = clientKey(clientIp(request), env.IP_SALT);
+    cooldownLast = await readCooldown(env.FEEDBACK_KV, cooldownKey(ipKey, pluginId));
+    fallback = await readFallback(env.FEEDBACK_KV, fallbackKey(ipKey, utcDay(now)));
   } catch {
     return storageFailure();
   }
-  const remaining = Math.max(0, DAILY_LIMIT - state.used);
-  return json(
-    200,
-    { remaining, dailyLimit: DAILY_LIMIT, resetAt: nextResetAt(Date.now()) },
+  return json(200, quotaView({ cooldownLast, fallback, now }), {
     // 额度 10 秒内不会变太多；给边缘缓存，挡住脚本循环刷 /quota 烧 KV 读额度。
-    { "cache-control": "public, max-age=10" },
-  );
+    "cache-control": "public, max-age=10",
+  });
 }
 
 async function handleFeedback(env, request) {
@@ -157,39 +189,57 @@ async function handleFeedback(env, request) {
     return json(400, { ok: false, error: "unknown_plugin" });
   }
 
-  const key = clientKey(clientIp(request), env.IP_SALT);
+  const ipKey = clientKey(clientIp(request), env.IP_SALT);
   const day = utcDay(Date.now());
-  const kvKey = "rl:" + key + ":" + day;
-  const now = Date.now();
+  const cdKey = cooldownKey(ipKey, pluginId);
+  const fbKey = fallbackKey(ipKey, day);
 
-  let state;
+  let cooldownLast;
+  let fallback;
   try {
-    state = await readState(env.FEEDBACK_KV, kvKey);
+    cooldownLast = await readCooldown(env.FEEDBACK_KV, cdKey);
+    fallback = await readFallback(env.FEEDBACK_KV, fbKey);
   } catch {
     return storageFailure();
   }
-  const verdict = decideLimit(state, now);
+
+  const now = Date.now();
+  const cd = decideCooldown(cooldownLast, now);
+  // 常规路径：本插件的 48 小时冷却已过，直接放行，不动兜底池。
+  // 兜底路径：冷却命中，动用跨插件共享的每日 3 条。
+  let verdict;
+  let nextFallback = fallback;
+  if (cd.available) {
+    verdict = { allowed: true, kind: "ok" };
+  } else {
+    verdict = decideFallback(fallback, now);
+    if (verdict.allowed) nextFallback = { used: fallback.used + 1, burst: [...verdict.burst, now] };
+  }
 
   if (!verdict.allowed) {
     return json(429, {
       ok: false,
       error: "rate_limited",
-      kind: verdict.kind,
-      // 突发限流时今天还剩额度，写 0 会让界面说「今天用完了」——那是假话。
-      remaining: verdict.kind === "daily" ? 0 : Math.max(0, DAILY_LIMIT - state.used),
-      resetAt: nextResetAt(now),
+      // burst = 兜底池的 10 分钟窗口撞了（本插件仍在 48h 冷却里）；
+      // cooldown = 本插件冷却中且兜底池也空了。
+      kind: verdict.kind === "burst" ? "burst" : "cooldown",
+      remaining: 0,
+      resetAt: cd.available ? nextResetAt(now) : cd.retryAt,
+      fallbackRemaining: verdict.kind === "burst" ? verdict.remaining : 0,
     });
   }
 
   // 先记额度再发信：SMTP 慢（TLS 握手通常 1-3 秒），先记可以缩小
   // 「连点十下、每下都绕过限流」的窗口。
   //
-  // 注意：KV 没有 compare-and-swap，跨实例的并发仍可能漏计（两个请求
-  // 同时读到 used=0）。这一步是**降低**重放，不是消除；要严格得上
-  // Durable Object。
-  const nextState = { used: state.used + 1, burst: [...verdict.burst, now] };
+  // 注意：KV 没有 compare-and-swap，跨实例的并发仍可能漏计。这步是
+  // **降低**重放，不是消除；要严格得上 Durable Object。
   try {
-    await writeState(env.FEEDBACK_KV, kvKey, nextState);
+    if (cd.available) {
+      await writeCooldown(env.FEEDBACK_KV, cdKey, now);
+    } else {
+      await writeFallback(env.FEEDBACK_KV, fbKey, nextFallback);
+    }
   } catch {
     return storageFailure();
   }
@@ -210,14 +260,26 @@ async function handleFeedback(env, request) {
     // 发信失败要把额度退回去，否则用户白白丢掉一次机会。
     // 退款自身失败不能让 catch 再抛（那会变成 HTML 500），吞掉并照常回 502。
     try {
-      await writeState(env.FEEDBACK_KV, kvKey, { used: state.used, burst: verdict.burst });
+      if (cd.available) {
+        // 常规路径：冷却恢复成发送前的值（通常是 0 = 从未发过）。
+        await writeCooldown(env.FEEDBACK_KV, cdKey, cooldownLast);
+      } else {
+        await writeFallback(env.FEEDBACK_KV, fbKey, fallback);
+      }
     } catch {
       /* 退款失败：额度会少一条，但至少接口还能回 JSON */
     }
-    return json(502, { ok: false, error: "smtp_failed", remaining: Math.max(0, DAILY_LIMIT - state.used) });
+    const after = quotaView({ cooldownLast, fallback, now });
+    return json(502, { ok: false, error: "smtp_failed", ...after });
   }
 
-  return json(200, { ok: true, remaining: Math.max(0, DAILY_LIMIT - nextState.used) });
+  // 发送成功后统一用配额视图回话：常规路径下本插件进入 48h 冷却，remaining=0。
+  const after = quotaView({
+    cooldownLast: cd.available ? now : cooldownLast,
+    fallback: nextFallback,
+    now,
+  });
+  return json(200, { ok: true, ...after });
 }
 
 export default {

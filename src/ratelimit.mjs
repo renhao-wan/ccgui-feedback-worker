@@ -1,13 +1,31 @@
 /**
  * 限流与邮件正文的纯函数。不碰 KV、不碰网络，方便直接单测。
  *
- * 额度口径（已确认）：**每 IP 每天 30 条，四个插件共享同一个池**。
- * 所以 clientKey 里刻意不带插件名——带上的话每个插件都会各有一份额度，
- * 「换个插件接着刷」就成了绕过手段。
+ * 额度口径（2026-11-23 改版）：**每 IP × 每插件，滚动 48 小时内 1 条**；
+ * 另有一个**每 IP 每天 3 条的兜底池**，跨四个插件共享，只在某插件冷却
+ * 命中时才动用。
+ *
+ * 为什么有两层：
+ *   - 插件零凭据、不收集设备指纹，Worker 唯一可信的身份是 IP。「每用户」
+ *     只能退化成「每 IP」，共享出口（公司 / 校园 / CGNAT）会误伤。
+ *   - 冷却键**带插件名**（每个插件独立 1 条），兜底池键**不带插件名**
+ *     （换插件刷也吃同一份）。「防跨插件刷」的职责由兜底池承担，不再靠
+ *     「共享一个大池」。
+ *
+ * 已知后果：单人 48 小时内最多 4 条（常规 1 + 兜底 3）。这是兜底池的
+ * 刻意代价，不是漏算。
  */
 
-export const DAILY_LIMIT = 30;
-export const BURST_LIMIT = 3;
+/** 同一 IP、同一插件的冷却窗口：滚动 48 小时。 */
+export const COOLDOWN_MS = 48 * 60 * 60 * 1000;
+/** 兜底池日额度：每 IP 每天，跨插件共享。 */
+export const FALLBACK_DAILY_LIMIT = 3;
+/**
+ * 兜底路径的突发保护：10 分钟内最多 2 条。
+ * 必须**严格小于** FALLBACK_DAILY_LIMIT——相等的话第三条永远先撞日额度，
+ * 突发保护就死了。兜底池本身只有 3 条/天，收紧到 2 条才拦得住连点。
+ */
+export const BURST_LIMIT = 2;
 export const BURST_WINDOW_MS = 10 * 60 * 1000;
 export const TEXT_LIMIT = 1000;
 /**
@@ -67,25 +85,71 @@ export function clientKey(ip, salt) {
   return (h1.toString(16).padStart(8, "0") + h2.toString(16).padStart(8, "0")).slice(0, 16);
 }
 
+/** 冷却键：每 IP × 每插件各一个，存上次发送时刻。带插件名，便于排查。 */
+export function cooldownKey(ipKey, pluginId) {
+  return "rl:cd:" + String(ipKey) + ":" + String(pluginId);
+}
+
+/** 兜底池键：每 IP × 每 UTC 日一个，**不带插件名**（跨插件共享）。 */
+export function fallbackKey(ipKey, day) {
+  return "rl:fb:" + String(ipKey) + ":" + String(day);
+}
+
 /**
- * 判定这次请求能不能放行。
+ * 这个插件的 48 小时冷却过了没有。
  *
- * @param {{used: number, burst: number[]}} state 当天已用条数与窗口内时间戳
+ * @param {unknown} last 上次发送时刻（毫秒）；0/脏值视为从未发过
+ * @param {number} now
+ * @returns {{available: boolean, retryAt: number}}
+ *   `retryAt` 只在冷却中时有意义（= last + 48h）。
+ */
+export function decideCooldown(last, now) {
+  const t = Number(last);
+  // 脏数据当作「没发过」：宁可多放一条，也不要把正常用户永久卡在冷却里。
+  if (!Number.isFinite(t) || t <= 0) return { available: true, retryAt: 0 };
+  const retryAt = t + COOLDOWN_MS;
+  return { available: now >= retryAt, retryAt };
+}
+
+/**
+ * 兜底池判定。结构沿用原 decideLimit 的 {used, burst}，只是额度从 30 收成 3。
+ *
+ * @param {{used: number, burst: number[]}} state
  * @param {number} now
  * @returns {{allowed: boolean, kind: string, remaining: number, burst: number[]}}
  */
-export function decideLimit(state, now) {
+export function decideFallback(state, now) {
   const used = Math.max(0, Number(state && state.used) || 0);
   const burst = Array.isArray(state && state.burst) ? state.burst.filter((t) => Number.isFinite(t)) : [];
   const recent = burst.filter((t) => now - t < BURST_WINDOW_MS);
 
-  if (used >= DAILY_LIMIT) {
-    return { allowed: false, kind: "daily", remaining: 0, burst: recent };
+  if (used >= FALLBACK_DAILY_LIMIT) {
+    return { allowed: false, kind: "fallback", remaining: 0, burst: recent };
   }
   if (recent.length >= BURST_LIMIT) {
-    return { allowed: false, kind: "burst", remaining: DAILY_LIMIT - used, burst: recent };
+    // 突发被拒时兜底池其实还有剩，回落真实值——写 0 会让界面谎报「用完了」。
+    return { allowed: false, kind: "burst", remaining: FALLBACK_DAILY_LIMIT - used, burst: recent };
   }
-  return { allowed: true, kind: "ok", remaining: DAILY_LIMIT - used - 1, burst: recent };
+  return { allowed: true, kind: "ok", remaining: FALLBACK_DAILY_LIMIT - used - 1, burst: recent };
+}
+
+/**
+ * `/quota` 的视图：本插件还能不能发（0/1），兜底池还剩几条，几时解冻。
+ *
+ * @param {{cooldownLast: unknown, fallback: {used: number}|null, now: number}} o
+ * @returns {{remaining: number, dailyLimit: number, resetAt: number, fallbackRemaining: number}}
+ */
+export function quotaView(o) {
+  const now = Number(o && o.now) || 0;
+  const cd = decideCooldown(o && o.cooldownLast, now);
+  const used = Math.max(0, Number(o && o.fallback && o.fallback.used) || 0);
+  return {
+    remaining: cd.available ? 1 : 0,
+    dailyLimit: 1,
+    // 解冻时刻用重试时刻；没在冷却时回次日零点，与旧字段语义保持一致。
+    resetAt: cd.available ? nextResetAt(now) : cd.retryAt,
+    fallbackRemaining: Math.max(0, FALLBACK_DAILY_LIMIT - used),
+  };
 }
 
 /**
